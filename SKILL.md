@@ -1,99 +1,128 @@
 ---
 name: pdfenv
-description: 带水印 PDF 文档的可靠读取与文本提取（评审论文/学位论文防伪水印场景）。当直接 Read PDF 报"binary file"失败、或 PDF 含竖排防伪水印/送审平台水印、需要先体检再抽样验证、或需要全文提取+水印噪声过滤时使用。内置隔离环境指引与四步法流程。
-agent_created: true
+description: 对学术论文、学位论文、送审稿等 PDF 进行非破坏性水印分析、文本提取、选择性高清渲染、双引擎视觉比对和按页 OCR。用户要求读取带防伪水印 PDF、修复提取错乱、精读图表/公式、处理扫描件时调用。
 metadata:
-  version: "1.0.0"
+  version: "2.2.1"
   category: pdf
+  changelog: "v1.0 行级启发式清洗（杨老师/WorkBuddy 实战版）→ v2.2 GPT 全面重构（texttrace 轨迹证据 + glyph 级过滤 + 审计回退 + 按需渲染/parity/OCR）→ v2.2.1 本机适配：import pymupdf as fitz 修复 PyMuPDF≥1.26 弃用警告污染 stdout 导致 --json 解析失败的问题；融合本机 venv 路径与实测记录"
 ---
 
-# pdfenv —— 带水印 PDF 可靠读取四步法
+# pdfenv v2.2 — 水印隔离与科研 PDF 渲染阅读
 
-> 实战来源：2026-10-17 成功读取 210 页带竖排防伪水印的博士论文评审 PDF
-> （《长安大学工程博士大论文.pdf》，送审平台水印层，pdfplumber 全文提取正常）。
+**本 Skill 只生成衍生文本/图像，不修改原始 PDF；任何清理结果都不是"被更改后的 PDF"。** 禁止未经确认就把水印、表格数值、公式或插图从原文件永久删除。
 
-## 核心结论（先记住这三条）
-
-1. **内置 Read 对部分 PDF 会直接失败**（报 `Cannot display content of binary file`），
-   尤其是含水印层/非常规编码的送审论文 PDF——失败后**立即降级到 Python 解析通道**，不要反复重试。
-2. **pdfplumber + pypdf 组合拳**：pdfplumber 提文本/表格，pypdf 读页数/元数据。
-   元数据 `Producer` 字段可直接判断文本型 vs 扫描型（扫描型才需要 OCR）。
-3. **水印 ≠ 不可读**：竖排防伪水印只是噪声层，不破坏正文文字。先抽样确认正文
-   语义连贯，后续分析时按规则过滤水印噪声即可。
-
-## 隔离环境（本机已建好，直接复用）
+## 本机环境（杨老师电脑已就绪，直接用，无需重建）
 
 ```
-VENV:   C:\Users\yangc\.workbuddy\binaries\python\envs\pdfenv
-PYTHON: C:\Users\yangc\.workbuddy\binaries\python\envs\pdfenv\Scripts\python.exe
-依赖:   pdfplumber, pypdf（阿里云镜像安装）
+VENV PYTHON: C:\Users\yangc\.workbuddy\binaries\python\envs\pdfenv\Scripts\python.exe
+SKILL 目录:  C:\Users\yangc\.workbuddy\skills\pdfenv
+已装依赖:    pymupdf 1.28.x, Pillow, pypdfium2, numpy, pdfplumber, pytest（阿里云镜像）
+OCR 状态:    Tesseract 未装 → --ocr 不可用（其余命令全可用）；需要 OCR 时先装 Tesseract + chi_sim
 ```
 
-若环境丢失，重建一条命令：
-
-```bash
-"C:\Users\yangc\.workbuddy\binaries\python\versions\3.13.12\python.exe" -m venv "C:\Users\yangc\.workbuddy\binaries\python\envs\pdfenv"
-"C:\Users\yangc\.workbuddy\binaries\python\envs\pdfenv\Scripts\python.exe" -m pip install pdfplumber pypdf -i https://mirrors.aliyun.com/pypi/simple/ -q
-```
-
-## 四步法流程
-
-```text
-直接 Read PDF
-├─ 成功 → 正常阅读，结束
-└─ 失败（binary file / 乱码）→ 降级 Python 通道
-     ① 体检：读页数 + 元数据（Producer 判断文本型/扫描型）
-     ② 抽样验证：前 5 页（封面/声明/摘要，最难解析区）+ 中部 2 页（正文真实质量）
-        ├─ 正文语义连贯 → 放心全文提取
-        └─ 正文乱码/为空 → 扫描型？转 OCR（pytesseract + pdf2image）
-     ③ 全文提取：pdfplumber 逐页 extract_text()
-     ④ 水印过滤：保守规则剔除噪声（见下），切忌过度过滤误伤正文
-```
-
-## 水印特征识别与过滤
-
-**识别**（以送审平台竖排水印为例）：
-- 提取文本中大量**单字符成行**（竖排水印被逐字拆行）；
-- 同一组字反复高频出现（如"平台测监量质文论位学中心位学"式字串拆散穿插）；
-- 日期数字水印（如"20261017—20261015"被拆成单个数字行）；
-- 水印字会**穿插在正文行内**（行尾粘字、行中断字），打乱阅读顺序但不破坏内容。
-
-**过滤规则（保守优先，宁漏勿伤）**：
-1. 整行为单字符或长度 ≤ 2 的行 → 剔除（中文正文行几乎不可能这么短）；
-2. 整行完全由已知水印字符集组成的行 → 剔除；
-3. 行内夹杂的水印字 → **不自动删**（会误伤"质/量/平/台"等正文常用字），
-   阅读时靠上下文忽略，或按坐标/对象属性做精细分离（进阶）。
-
-## 用法（scripts/read_pdf.py）
+本机直接这样调用（区别于通用的 .venv 安装指引）：
 
 ```bash
 PY="C:/Users/yangc/.workbuddy/binaries/python/envs/pdfenv/Scripts/python.exe"
-SCRIPT="C:/Users/yangc/.workbuddy/skills/pdfenv/scripts/read_pdf.py"
-
-# 体检：页数 + 元数据（第一步，判断文本型/扫描型）
-$PY "$SCRIPT" info  "D:/path/to/论文.pdf"
-
-# 抽样验证：前 5 页 + 中部 2 页（第二步）
-$PY "$SCRIPT" sample "D:/path/to/论文.pdf"
-
-# 全文提取 + 水印过滤 → 输出 txt（第三、四步）
-$PY "$SCRIPT" full   "D:/path/to/论文.pdf" -o "D:/path/to/输出.txt" --clean
-
-# 提取指定页范围（如只读第 3 章对应的 50-80 页）
-$PY "$SCRIPT" full   "D:/path/to/论文.pdf" -o "第3章.txt" --pages 50-80 --clean
-
-# 表格提取（评审核对数据时用）
-$PY "$SCRIPT" tables "D:/path/to/论文.pdf" --pages 100-110
+S="C:/Users/yangc/.workbuddy/skills/pdfenv"
+"$PY" "$S/scripts/read_pdf.py" info   "论文.pdf" --json
+"$PY" "$S/scripts/read_pdf.py" full   "论文.pdf" --clean --format md -o "论文_正文.md"
+"$PY" "$S/scripts/read_pdf.py" render "论文.pdf" --pages 51 --dpi 300 -o renders
 ```
 
-## Windows 环境小坑（必看）
+## 使用决策（必须按顺序）
 
-1. **Git Bash 写文件前先 `mkdir -p` 确认目录存在**——heredoc 重定向到不存在目录会失败；
-2. Python 脚本开头加 `sys.stdout.reconfigure(encoding="utf-8")`，防控制台中文乱码；
-3. 路径一律带引号（评审论文路径常含中文和空格）。
+1. **先体检：** `info --json` 检查总页数、各代表页原生字符数、图像覆盖率和方向。不能仅用 `Producer` 判断扫描件。
+2. **再抽样：** `sample` 覆盖封面、摘要、主体中部和结尾。确认语言、双栏、公式、表格和文字层的质量。
+3. **按需提取：** `full --clean --format md` 仅对透明度、颜色、方向、跨页重复坐标等证据一致的**高置信度矢量文字水印**做预拼接过滤。严禁按“单字/短行”删除。必须保留 `.watermark-audit.json`。
+4. **视觉核验：** 对出现表格、图、公式、图片型水印或版面异常的页面使用 `render --pages`；大型页面用 `--clip`/`--clip-rel`，高清时配合 `--tile`，避免整本全部栅格化。
+5. **异常排查：** 对渲染缺字/色块/图形位置异常，用 `parity` 比对 MuPDF 与 PDFium。两者结果不一致时报告而非猜测；像素差异并不能直接断言原 PDF 已损坏。
+6. **逐页 OCR：** 仅当原生文本不足且高图像覆盖、或人工确认文字层不可用时使用 `--ocr auto/force`。OCR 不是公式、图表和数值的最终依据，关键数据回看原页面。
+7. **报告不确定性：** 审计中的 `needs_review_pages` 和 `rollback_pages` 必须交代；高比例候选删除会直接回退到原生文字。文字层与渲染截图冲突时，图像用于视觉核对，必要时检查 PDF 原始对象。
 
-## 实测记录
+## 安装（Python 3.10+，Windows/macOS/Linux）
 
-| 日期 | 对象 | 结果 |
-|---|---|---|
-| 2026-10-17 | 长安大学工程博士论文（210 页，竖排防伪水印，iText 5.5.13 生成） | 体检+抽样+全文提取全部成功，水印过滤后文本可直接用于评审分析 |
+在 Skill 目录中执行：
+
+```bash
+python -m venv .venv
+# Windows PowerShell（在 Windows 执行）：
+# .\.venv\Scripts\python.exe -m pip install -r requirements-core.txt
+# .\.venv\Scripts\python.exe -m pip install -r requirements-optional.txt
+# macOS/Linux（在 Unix 系统执行）：
+.venv/bin/python -m pip install -r requirements-core.txt
+.venv/bin/python -m pip install -r requirements-optional.txt
+```
+
+OCR 另需系统安装 **Tesseract** 和语言包 `chi_sim`、`eng`。可用 `tesseract --list-langs` 检查；未安装 OCR 引擎不影响其它命令。代码不绑定某个人的 Python 路径；在 Windows 上建议使用相同虚拟环境中的 `python.exe`。
+
+## 常用命令（从 Skill 目录执行）
+
+```bash
+# PDF 结构、页面抽样
+python scripts/read_pdf.py info "论文.pdf" --json
+python scripts/read_pdf.py sample "论文.pdf"
+
+# 全文 -> Markdown + 审计 JSON；与原版兼容 --clean/--pages/-o
+python scripts/read_pdf.py full "论文.pdf" --clean --format md -o "论文_正文.md"
+python scripts/read_pdf.py full "论文.pdf" --pages 50-80 --clean --format md -o "第三章.md"
+
+# 先审计再决定是否自动过滤（严格文献核对优先）
+python scripts/read_pdf.py audit "论文.pdf" --pages 10-15 -o watermark_audit.json
+python scripts/read_pdf.py full "论文.pdf" --clean --max-remove-ratio 0.15 -o output.txt
+
+# 高精度渲染：指定页；自动生成 render_manifest.json
+python scripts/read_pdf.py render "论文.pdf" --pages 50-52 --dpi 200 -o renders
+python scripts/read_pdf.py render "论文.pdf" --pages 51 --dpi 450 --tile 2 -o figure_51
+
+# 选取页面中部四分之一：相对坐标 [0,1]，以左上为原点
+python scripts/read_pdf.py render "论文.pdf" --pages 51 --dpi 400 --clip-rel 0.25 0.25 0.75 0.75 -o crop
+
+# 以红色方框可视化检测到的水印位置：仅用于核验
+python scripts/read_pdf.py render "论文.pdf" --pages 51 --dpi 200 --mark-watermarks -o verify
+# 如果水印实际是 PDF 注释层，MuPDF 渲染可选择隐藏注释
+python scripts/read_pdf.py render "论文.pdf" --pages 51 --hide-annots -o no_annotations
+
+# 图片渲染引擎备选 / 像素级双引擎对照
+python scripts/read_pdf.py render "论文.pdf" --pages 51 --engine pdfium -o pdfium_renders
+python scripts/read_pdf.py parity "论文.pdf" --pages 51 --dpi 150 -o renderer_compare
+
+# 扫描页：仅需 OCR 的页；谨慎使用 --ocr-preprocess suppress-light
+python scripts/read_pdf.py full "论文.pdf" --pages 30-31 --ocr auto --ocr-lang chi_sim+eng --format md -o ocr_pages.md
+
+# 结构化表格（需 pdfplumber，仍应对照原图验证）
+python scripts/read_pdf.py tables "论文.pdf" --pages 51-55 -o tables.json
+```
+
+### 自动化代理执行限制
+
+- 不传 `--pages` 时，`render` 仅渲染代表页，不可默认渲染整本。渲染页数默认最多 30；用户明确要求批量导出时可加 `--force-many`。
+- 每个输出图像限制 `--max-pixels`（默认 2600 万像素）。超过预算**报错并建议裁切/切片**，不静默缩小 DPI。`--tile 2` 将页面分成 2×2 张，不会降低各张 DPI。
+- 对于 PDF 文字层已存在且可靠的页面，禁止“先栅格化再 OCR”作为默认步骤：OCR 往往丢失数学符号、上/下标、希腊字母、表格层次。
+- `--clean` 只过滤高置信度的原生文字水印：**扫描进图片的水印、XObject 图片、复杂剪裁图层、全文不重复的签章**不保证能自动识别。对此优先局部渲染并报告需要人工审核。
+- `--hide-annots` 只适用于 `--engine mupdf`，可隐藏**注释对象**，但不能消除直接绘制在页面内容流中的文字、图片水印。
+- `--ocr-preprocess suppress-light` 会抹掉浅色线条、图表网格和浅灰注释，必须显式授权/核验才使用，永不作为默认配置。
+- 多栏论文、图注位置、复杂公式、特殊字体编码和旋转页面仍可能影响文本阅读顺序或坐标。需要依据原页渲染校核。
+- 若权限/环境受限无法 OCR、无法安装语言包、无法渲染某页，明确记录页码、错误和仍可验证的提取结果；不得声称全文已完成核查。
+
+## 输出及验证要求
+
+- `full -o *.md`：逐页标记文本、保留小于 3 字符的合法行、行内字符不依高频字符集合删改。
+- `full --clean -o`：自动写 `*.watermark-audit.json`，含原件 SHA256、样本页、候选框、实际移除字符数、回退页与待复核页。
+- `render -o 目录`：页面 PNG/JPEG 和 `render_manifest.json`，含 PDF 坐标裁剪框、DPI 和尺寸；PNG 优先供公式/细线辨认。
+- `parity -o 目录`：两种渲染器生成的图片、diff 图以及 `parity.json`；不同抗锯齿和色彩管理会产生正常差异。
+- 任一关键数据的最终复核：**原 PDF 页面及可视化渲染图优先于经过清洗的文本**。
+
+参考技术细节与局限：`docs/TECHNICAL_NOTES.md`；GPT 升级审查报告：`docs/REVIEW_REPORT.md`；示例与测试：`tests/test_pdfenv.py`。
+
+## 实测记录（本机，2026-10-18 验收 v2.2.1）
+
+| 验证项 | 结果 |
+|---|---|
+| 自带 10 项 pytest | 9 通过、1 跳过（OCR 无 Tesseract 属预期） |
+| info --json（210 页评审论文） | 正常（v2.2 原版因 fitz 弃用警告污染 stdout 挂在 --json 上，v2.2.1 已修复） |
+| full --clean --format md（第 5-6 页） | **行内穿插水印字被 glyph 级精准剔除、正文零误伤**，效果优于 v1 行级过滤（v1 只能保守保留行内水印字） |
+| 水印审计 JSON | 识别出完整水印串"学位中心学位论文质量监测平台——993975485——20261017"（opacity 0.08、24pt、跨 14 采样页坐标复现），每页删 111 glyph、删除比 12%~22%、未触发回退 |
+| render 第 51 页 @200dpi | PNG + render_manifest.json 正常输出 |
+
+**准确性优先级：PDF 原件 > 原件渲染 > 经过水印过滤的文本 > OCR 推断。**
